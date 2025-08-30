@@ -1,0 +1,177 @@
+/*
+  MKR1010 + Arduino IoT Cloud + WiFiNINA (explicit)
+  - Uses secrets/connection from thingProperties.h
+  - Prints WiFiNINA firmware and WiFi status
+  - Updates Cloud var `temp` with a test waveform so you can see data in the dashboard
+*/
+
+#include <SPI.h>
+#include <WiFiNINA.h>          // <-- explicitly use WiFiNINA
+#include "thingProperties.h"   // contains SECRET_SSID / SECRET_PASS + WiFi connection handler
+#include <DHT.h>
+
+
+// 
+#define DHTPIN   7 // evt change to right pin 
+#define DHTTYPE  DHT11
+#define LDR_PIN  A0
+DHT dht(DHTPIN, DHTTYPE);
+
+// Exponential moving average for smoothing
+float ema = 0.0f;
+const float ALPHA = 0.2f;  // 0..1 (higher = more responsive, lower = smoother)
+
+// Auto-calibration of min/max observed values
+// or for Arduino Uno = int seenMin = 1023;
+int seenMin = 4095;
+int seenMax = 0;
+
+
+// Heartbeat / demo data
+unsigned long lastReport = 0;
+unsigned long lastUpdate = 0;
+
+//This function takes an integer status code and prints a corresponding message to the serial monitor, helping to debug WiFi connection issues.
+void printStatusName(int s) {
+  switch (s) {
+    case WL_IDLE_STATUS:      Serial.println("WL_IDLE_STATUS"); break;
+    case WL_NO_SSID_AVAIL:    Serial.println("WL_NO_SSID_AVAIL"); break;
+    case WL_SCAN_COMPLETED:   Serial.println("WL_SCAN_COMPLETED"); break;
+    case WL_CONNECTED:        Serial.println("WL_CONNECTED"); break;
+    case WL_CONNECT_FAILED:   Serial.println("WL_CONNECT_FAILED"); break;
+    case WL_CONNECTION_LOST:  Serial.println("WL_CONNECTION_LOST"); break;
+    case WL_DISCONNECTED:     Serial.println("WL_DISCONNECTED"); break;
+    default:                  Serial.print("Unknown ("); Serial.print(s); Serial.println(")"); break;
+  }
+}
+
+void setup() {
+  Serial.begin(9600);
+  delay(1500);
+
+  Serial.println("\nMKR1010 + IoT Cloud + WiFiNINA");
+
+  // Sanity checks / info from WiFiNINA
+  if (WiFi.status() == WL_NO_MODULE) {
+    Serial.println("ERROR: WiFiNINA module not found. Check board/USB.");
+    while (true) {}
+  }
+  Serial.print("WiFiNINA firmware: ");
+  Serial.println(WiFi.firmwareVersion());
+  Serial.println("Note: MKR1010 supports 2.4 GHz networks only.");
+
+  // Initialize Cloud properties and connect using WiFi (from thingProperties.h)
+  initProperties();
+  ArduinoCloud.begin(ArduinoIoTPreferredConnection);
+
+  // Verbose Cloud debug during setup
+  setDebugMessageLevel(4);
+  ArduinoCloud.printDebugInfo();
+
+
+  // DHT
+  pinMode(DHTPIN, INPUT_PULLUP);
+  dht.begin();
+
+  Serial.println("Setup complete. Connecting...");
+  
+}
+
+void loop() {
+  // Maintain Cloud/MQTT + WiFi
+  ArduinoCloud.update();
+
+  // WIFI checker, for troubleshooting and checking if connected to cloud and wifi
+  // Print a small status every 3s = 3000 in value
+  if (millis() - lastReport > 5000) {
+    lastReport = millis();
+    Serial.print("WiFi.status(): ");
+    printStatusName(WiFi.status());
+    Serial.print("Cloud connected? ");
+    Serial.println(ArduinoCloud.connected() ? "yes" : "no");
+
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.print("IP: ");   Serial.println(WiFi.localIP());
+      Serial.print("RSSI: "); Serial.print(WiFi.RSSI()); Serial.println(" dBm");
+    }
+  }
+  
+
+  if (millis() - lastUpdate > 2000 && ArduinoCloud.connected()) {
+    lastUpdate = millis();
+    readSensors();    
+
+    // simple test code
+    // Simple 20–30 °C waveform for testing (no sensor required)
+    //float seconds = millis() / 1000.0f;
+    //temp = 25.0f + 5.0f * sin(seconds * 0.5f);
+  
+    //Serial.print("Pushing temp = ");
+    //Serial.println(temp, 2);
+  
+    // test code for dashboard      
+    // 0–100% wave
+    //float wave = sin(seconds * 0.5f);     // -1..1
+    //int pct = (int)roundf(50.0f + 50.0f * wave); // 0..100
+    //pct = constrain(pct, 0, 100);
+    //lightPct = pct;
+    //humidity = pct;
+  }
+}
+
+
+void readSensors(){
+  
+  // DHT11, temp is measured in Celsius
+  float h = dht.readHumidity();
+  float t = dht.readTemperature(); // °C
+  if (!isnan(h) && !isnan(t)) {
+    humidity = h;
+    temp  = t;
+  } else {
+    Serial.println("DHT read failed");
+  }
+
+  // LDR (oversample & EMA)
+
+  // Take a few fast samples and average them to reduce jitter
+  const int N = 8;
+  long acc = 0;
+  for (int i = 0; i < N; i++) {
+    acc += analogRead(LDR_PIN);
+    delayMicroseconds(300); // short settle
+  }
+  int raw = acc / N;
+
+  // Update smoothing with Exponential Moving Average (EMA)
+  static bool init = false;
+  if (!init) { ema = raw; init = true; }
+  else       { ema = ALPHA * raw + (1.0f - ALPHA) * ema; }
+
+  // Track observed range for auto-calibration (lowest/highest recored)
+  if (raw < seenMin) seenMin = raw;
+  if (raw > seenMax) seenMax = raw;
+
+  // Map smoothed value to 0–100% using observed min/max (with guard rails)
+  int lo = seenMin;
+  int hi = seenMax;
+  // 1023 for Arduino UNO , 4095 for MKR 1010 
+  if (hi - lo < 10) { lo = 0; hi = 4095; } // until we’ve seen enough variation
+
+  int pct = 0;
+  long denom = (long)hi - lo;
+  if (denom > 0) {
+    long p = (long)(ema - lo) * 100L / denom;
+    if (p < 0) p = 0; if (p > 100) p = 100;
+    pct = (int)p;
+  }
+  lightPct = pct;
+
+  // Debug in serial monitor
+  Serial.print("T: "); Serial.print(temp, 1);
+  Serial.print(" °C  H: "); Serial.print(humidity, 1);
+  Serial.print(" %  Light: "); Serial.print(lightPct);
+  Serial.print(" % (raw "); Serial.print(raw);
+  Serial.print(" range["); Serial.print(seenMin); Serial.print(","); Serial.print(seenMax); Serial.println("])");
+}
+
